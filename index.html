@@ -195,6 +195,9 @@ body{background:#0b0d10}
 <script>
 const $=s=>document.querySelector(s);const $$=s=>[...document.querySelectorAll(s)];
 const STORAGE='pelada_manager_v20_solo';
+const SYNC_URL='https://tnimpyuszqmynjxxghqq.supabase.co';
+const SYNC_KEY='sb_publishable_ROJAa2A_4OmGTPMj2K3bBA_XDacGhDs';
+let remoteReady=false,remoteUpdatedAt=0,remoteSaveTimer=null,applyingRemote=false,lastRemotePayload='';
 const esc=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const initials=name=>String(name||'?').trim().split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]||'').join('').toUpperCase()||'?';
 function avatarHtml(){return '';}
@@ -248,7 +251,77 @@ function normalize(){
   }
 }
 normalize();
-function persist(){localStorage.setItem(STORAGE,JSON.stringify(state));}
+
+function stateIsEmpty(s){return !s||(!(s.players||[]).length&&!(s.history||[]).length&&!s.active);}
+function mergeStates(remote,local){
+  const out={players:[],active:null,history:[],accounts:[],signupRequests:[],currentAccountId:null,...(remote||{})};
+  const players=new Map((out.players||[]).map(p=>[p.id,p]));
+  for(const p of (local?.players||[])){
+    if(players.has(p.id))continue;
+    const same=[...players.values()].find(x=>normalizedName(x.name)===normalizedName(p.name)&&x.type===p.type);
+    if(!same)players.set(p.id,p);
+  }
+  out.players=[...players.values()];
+  const hist=new Map((out.history||[]).map(h=>[h.id,h]));
+  for(const h of (local?.history||[]))if(!hist.has(h.id))hist.set(h.id,h);
+  out.history=[...hist.values()];
+  if(!out.active&&local?.active)out.active=local.active;
+  return out;
+}
+async function pushRemote(force=false){
+  if(!remoteReady&&!force)return;
+  const payload=JSON.stringify(state);
+  if(!force&&payload===lastRemotePayload)return;
+  try{
+    const now=new Date().toISOString();
+    const r=await fetch(SYNC_URL+'/rest/v1/app_state?id=eq.main',{
+      method:'PATCH',
+      headers:{apikey:SYNC_KEY,'Content-Type':'application/json','Prefer':'return=representation'},
+      body:JSON.stringify({state,updated_at:now})
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const rows=await r.json();
+    remoteUpdatedAt=Date.parse(rows?.[0]?.updated_at||now)||Date.now();
+    lastRemotePayload=payload;
+    remoteReady=true;
+  }catch(e){console.warn('Falha ao salvar no banco compartilhado',e);}
+}
+function scheduleRemoteSave(){
+  if(applyingRemote)return;
+  clearTimeout(remoteSaveTimer);
+  remoteSaveTimer=setTimeout(()=>pushRemote(false),250);
+}
+async function pullRemote(initial=false){
+  try{
+    const r=await fetch(SYNC_URL+'/rest/v1/app_state?id=eq.main&select=state,updated_at',{
+      headers:{apikey:SYNC_KEY,'Cache-Control':'no-cache'}
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const rows=await r.json(),row=rows?.[0];
+    if(!row)return;
+    const server=row.state||{},serverTs=Date.parse(row.updated_at)||0;
+    if(initial){
+      if(stateIsEmpty(server)&&!stateIsEmpty(state)){
+        remoteReady=true;remoteUpdatedAt=serverTs;
+        await pushRemote(true);return;
+      }
+      const merged=mergeStates(server,state);
+      const shouldPush=JSON.stringify(merged)!==JSON.stringify(server);
+      applyingRemote=true;state=merged;normalize();localStorage.setItem(STORAGE,JSON.stringify(state));renderAll();applyingRemote=false;
+      remoteUpdatedAt=serverTs;lastRemotePayload=JSON.stringify(server);remoteReady=true;
+      if(shouldPush)await pushRemote(true);
+      return;
+    }
+    if(serverTs>remoteUpdatedAt&&JSON.stringify(server)!==JSON.stringify(state)){
+      applyingRemote=true;state=server;normalize();localStorage.setItem(STORAGE,JSON.stringify(state));renderAll();applyingRemote=false;
+      remoteUpdatedAt=serverTs;lastRemotePayload=JSON.stringify(server);
+    }
+  }catch(e){console.warn('Falha ao atualizar do banco compartilhado',e);}
+}
+function persist(){
+  localStorage.setItem(STORAGE,JSON.stringify(state));
+  scheduleRemoteSave();
+}
 function getPlayer(id){return state.players.find(p=>p.id===id);}
 function getAccount(id){return state.accounts.find(a=>a.id===id);}
 function currentAccount(){return getAccount(state.authenticatedAccountId)||null;}
@@ -524,6 +597,10 @@ function logout(){state.authenticatedAccountId=null;persist();renderRoot();}
 function applyRoleNavigation(){document.body.classList.remove('player-mode');document.body.classList.add('admin-mode');}
 function renderAll(){applyRoleNavigation();renderPlayers();renderStats();renderEventHistory();renderHomeState();persist();}
 nowDefaults();renderAll();
+pullRemote(true).finally(()=>{
+  remoteReady=true;
+  setInterval(()=>pullRemote(false),2000);
+});
 </script>
 </body>
 </html>
